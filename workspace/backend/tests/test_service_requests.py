@@ -104,3 +104,31 @@ def test_cloud_dispatch_waits_for_review(client, workspace, db, configured, monk
     assert result.status_code == 200, result.text
     assert invoke.call_args.args[1]['metadata']['target_agents'] == ['agent-alpha']
     assert invoke.call_count == 2
+
+
+def test_private_thread_rejection_preserves_requester_identity(client, workspace, db, configured):
+    from app.models import Channel, ChannelHumanMember
+    channel = db.scalar(select(Channel).where(Channel.workspace_id == workspace['id'], Channel.name == _chan(workspace)))
+    channel.visibility = 'private'
+    channel.owner_email = 'olivia@acme.test'
+    for email in ('olivia@acme.test', 'mia@acme.test'):
+        if db.get(ChannelHumanMember, (channel.id, email)) is None:
+            db.add(ChannelHumanMember(channel_id=channel.id, user_email=email))
+    db.commit()
+    response = send(client, workspace)
+    assert response.status_code == 200, response.text
+    approval = request(db, workspace)
+    snapshot = approval.policy_requirements['service_trigger']
+    assert snapshot['payload']['sender_email'] == 'olivia@acme.test'
+    assert not snapshot['metadata'].get('sender_email')
+    rejected = client.post(f'/v1/approvals/{approval.id}/reject', headers=_bearer('mia'), json={'network': workspace['id']})
+    assert rejected.status_code == 200, rejected.text
+    db.expire_all()
+    assert approval.status == 'rejected'
+    card = db.get(EventRecord, approval.resolution_event_id)
+    assert card is not None
+    assert card.source == snapshot['source']
+    assert card.payload['sender_email'] == 'olivia@acme.test'
+    assert card.payload['message_type'] == 'approval'
+    assert card.metadata_['target_agents'] == ['__no_response__']
+    assert 'Run the report' not in card.payload['content']

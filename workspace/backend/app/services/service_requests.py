@@ -74,8 +74,10 @@ async def gate_requests(event, context):
                 "trigger_event_id": event.id, "agent_owner": reviewer if member.kind in (THREAD_KIND, ISSUE_KIND) else None})
         db.add(request)
         db.flush()
+        from app.services.message_identity import human_sender_email
         card = Event(type="workspace.message.posted", source=event.source, target=event.target, visibility=event.visibility,
             payload={"content": approvals._request_text(request), "message_type": "approval",
+                     "sender_email": human_sender_email(event.payload, event.metadata),
                      "approval": approvals.serialize(request)},
             metadata={"approval_id": request.id, "target_agents": ["__no_response__"]})
         request.request_event_id = card.id
@@ -130,6 +132,9 @@ def release_request(db, workspace, approval, actor_label):
             from fastapi import HTTPException
             raise HTTPException(403, "Service access was revoked; request cannot start")
     payload = deepcopy(original["payload"]) if accepted else {}
+    if not accepted:
+        from app.services.message_identity import human_sender_email
+        payload["sender_email"] = human_sender_email(original.get("payload"), original.get("metadata"))
     payload.update({"message_type": "chat" if accepted else "approval", "approval": approvals.serialize(approval)})
     payload["content"] = (f"Approved by {actor_label}. Task request:\n{payload.get('content', '')}"
                           if accepted else f"Task request rejected by {actor_label}.")

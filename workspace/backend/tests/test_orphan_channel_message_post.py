@@ -15,11 +15,8 @@ Two live cases produced this: the dashboard verification harness (it uses a
 fresh ``dashboard-verification-<hex>`` name as a scratch scope and posts into
 it) and the workflow engine's task threads (``task:<uuid>``).
 
-The same dead end exists for a *deleted* thread: issue and task deletion only
-set ``Channel.status = "deleted"``, the resolver had no status filter so it
-returned the tombstone, and ``uq_channels_ws_name`` covers every status so the
-name can never be created again. A post into it is therefore just as stranded
-until the row is revived.
+Deleted rows are deliberate tombstones. Posting must reject rather than undo
+an explicit task/issue deletion, preserving the row and its identity.
 """
 
 from sqlalchemy import select
@@ -128,10 +125,8 @@ def test_materialized_thread_keeps_visibility_invariant(client, workspace, db):
     assert channel.created_by == "openagents:agent-alpha"
 
 
-def test_message_to_a_deleted_thread_revives_it(client, workspace, db):
-    """A deleted thread is a tombstone whose name can never be reused
-    (`uq_channels_ws_name` spans every status). A message into it must revive
-    the row instead of storing a message nobody can reach."""
+def test_message_to_a_deleted_thread_is_rejected(client, workspace, db):
+    """A late reply must not undo explicit deletion or persist new content."""
     assert _post(client, workspace, MARK, "before delete").status_code == 200
     channel = db.execute(
         select(Channel).where(
@@ -142,9 +137,11 @@ def test_message_to_a_deleted_thread_revives_it(client, workspace, db):
     db.commit()
 
     response = _post(client, workspace, MARK, "after delete")
-    assert response.status_code == 200, response.text
+    assert response.status_code == 403, response.text
+    assert response.json()["message"] == "channel_deleted_forbidden"
     db.refresh(channel)
-    assert channel.status == "active", "posting left the thread deleted — invisible again"
+    assert channel.status == "deleted"
+    assert len(db.execute(select(EventRecord).where(EventRecord.target == f"channel/{MARK}")).scalars().all()) == 1
 
     # Id is preserved (the messages still belong to the same thread) ...
     assert db.execute(
@@ -152,21 +149,20 @@ def test_message_to_a_deleted_thread_revives_it(client, workspace, db):
             Channel.workspace_id == workspace["id"], Channel.name == MARK,
         )
     ).scalar_one().id == channel.id
-    # ... and the thread is reachable again, not merely stored.
+    # ... and the tombstone remains hidden and unopenable.
     discovery = client.get(
         f"/v1/discover?network={workspace['id']}", headers=_headers(workspace),
     ).json()["data"]
-    assert any(c["address"] == f"channel/{MARK}" for c in discovery["channels"])
+    assert not any(c["address"] == f"channel/{MARK}" for c in discovery["channels"])
     participants = client.get(
         f"/v1/channels/{MARK}/participants?network={workspace['id']}",
         headers=_headers(workspace),
     )
-    assert participants.status_code == 200, participants.text
+    assert participants.status_code == 404, participants.text
 
 
-def test_revival_of_a_deleted_thread_keeps_its_identity(client, workspace, db):
-    """Reviving must not re-run channel.create: title, owner, visibility and
-    members stay exactly as the deleted thread had them."""
+def test_rejection_keeps_deleted_thread_identity(client, workspace, db):
+    """Rejection preserves the tombstone's title, owner, visibility and members."""
     from app.models import ChannelHumanMember, ChannelMember
 
     assert _post(client, workspace, MARK).status_code == 200
@@ -184,18 +180,18 @@ def test_revival_of_a_deleted_thread_keeps_its_identity(client, workspace, db):
     db.commit()
     channel_id = channel.id
 
-    assert _post(client, workspace, MARK, "resumed").status_code == 200
+    assert _post(client, workspace, MARK, "resumed").status_code == 403
     db.expire_all()  # the request used its own session; drop our cached copy
-    revived = db.execute(
+    tombstone = db.execute(
         select(Channel).where(Channel.id == channel_id)
     ).scalar_one()
-    assert revived.status == "active"
-    assert revived.title == "Parked work"
-    assert revived.visibility == "private"
-    assert revived.owner_email == "owner@example.test"
+    assert tombstone.status == "deleted"
+    assert tombstone.title == "Parked work"
+    assert tombstone.visibility == "private"
+    assert tombstone.owner_email == "owner@example.test"
     assert {m.user_email for m in db.execute(
         select(ChannelHumanMember).where(ChannelHumanMember.channel_id == channel_id)
     ).scalars()} == {"owner@example.test"}
     assert {m.agent_name for m in db.execute(
         select(ChannelMember).where(ChannelMember.channel_id == channel_id)
-    ).scalars()} >= {"agent-beta"}
+    ).scalars()} == {"agent-alpha", "agent-beta"}

@@ -2139,6 +2139,28 @@ def _materialize_channel(event: Event, payload: dict, workspace, db, channel_nam
 
     creator_email = human_sender_email(payload, event.metadata)
     identified_human = bool(creator_email) and (event.source or "").startswith("human:")
+    # This is a creation path, so validate invitations before writing any
+    # membership. Routing ACLs run later and cannot undo an unauthorized
+    # participant row. Use the same direct-access rule as channel.create,
+    # including identified human senders on the internal pipeline path.
+    from app.models import WorkspaceMember
+    from app.services.access_model import Principal, can_start_agent_thread
+    from app.services.personal_assistant import is_yumi, PERSONAL_ONLY
+
+    participants = payload.get("participants") or []
+    requested = set(participants)
+    if (event.source or "").startswith("openagents:"):
+        requested.add(event.source[len("openagents:"):])
+    if any(is_yumi(db, workspace.id, name) for name in requested):
+        raise EventRejected("workspace_mod", PERSONAL_ONLY)
+    if identified_human:
+        creator = Principal("human", email=creator_email, workspace_id=str(workspace.id))
+        for name in requested - {"", "__no_response__"}:
+            member = db.get(WorkspaceMember, (str(workspace.id), name))
+            if not member or member.status == "removed" or not can_start_agent_thread(
+                db, str(workspace.id), creator, member,
+            ):
+                raise EventRejected("workspace_mod", "channel_participant_forbidden")
     visibility = normalize_visibility(payload.get("visibility")) if payload.get("visibility") else None
     if visibility not in ("private", "public"):
         visibility = "private" if identified_human else "public"
@@ -2153,8 +2175,35 @@ def _materialize_channel(event: Event, payload: dict, workspace, db, channel_nam
         owner_email=creator_email if identified_human else None,
         director_email=creator_email if identified_human else None,
     )
-    db.add(channel)
-    db.flush()
+    # Match the existing first-user insertion pattern: only roll back this
+    # candidate, never the caller's transaction or a competitor's channel.
+    import sqlite3
+    from sqlalchemy.exc import IntegrityError
+
+    connection = db.connection()
+    if connection.dialect.name == "sqlite" and not connection.connection.driver_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN")
+    savepoint = db.begin_nested()  # flush caller writes outside our error handler
+    try:
+        with savepoint:
+            db.add(channel)
+            db.flush()
+    except IntegrityError as exc:
+        constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+        name_conflict = constraint == "uq_channels_ws_name" or (
+            isinstance(exc.orig, sqlite3.IntegrityError)
+            and str(exc.orig) == "UNIQUE constraint failed: channels.workspace_id, channels.name"
+        )
+        if not name_conflict:
+            raise
+        winner = db.execute(select(Channel).where(
+            Channel.workspace_id == workspace.id, Channel.name == channel_name,
+        )).scalar_one_or_none()
+        if winner is None:
+            raise
+        # The resolver applies the winner's status and ACL. Do not enroll
+        # the losing creator or any of their requested participants.
+        return winner
 
     if creator_email:
         db.add(ChannelHumanMember(channel_id=channel.id, user_email=creator_email))
@@ -2220,6 +2269,8 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
         if requester:
             event.metadata["requester_email"] = requester
 
+    event.metadata.pop("channel_materialized", None)
+    event.metadata.pop("channel_revived", None)
     event.metadata.pop("recalled", None)
     event.metadata.pop("recalled_at", None)
     event.metadata.pop("recalled_message_id", None)
@@ -2249,21 +2300,6 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
             # the router checks session_error and returns an error response.
             return event
 
-    # "thinking", "status", and "todos" messages are intermediate agent output
-    # — they should NOT trigger other agents. "approval" is an agent asking a
-    # PERSON for permission (see services/approvals): it is addressed to humans,
-    # never routed to agents.
-    if message_type in ("thinking", "status", "todos", "approval", "artifact"):
-        return event
-
-    # An agent's failure report ends its turn; it is never a request. Routed
-    # like a reply it reached another agent, whose answer @-ing the failed one
-    # ran it again — with nothing counting hops, a Codex on a 429 posted an
-    # error every ~20s for hours.
-    if event.source.startswith("openagents:") and _is_failure_report(event):
-        event.metadata["target_agents"] = ["__no_response__"]
-        return event
-
     # Parse @mentions from message content (used for human message routing)
     all_members = db.execute(
         select(WorkspaceMember).where(
@@ -2292,17 +2328,11 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
         ).scalar_one_or_none()
         if channel is None:
             channel = _materialize_channel(event, payload, workspace, db, channel_name)
-        elif channel.status == "deleted":
-            # A deleted thread is a tombstone, and `uq_channels_ws_name` spans
-            # every status, so its name can never be created again. A message
-            # into it would store and read back over `GET /v1/events?channel=`
-            # yet stay out of `/v1/discover`, because every thread endpoint
-            # filters `status != "deleted"` and answers 404. A message is
-            # evidence the thread is live again — revive it (title, owner and
-            # members are untouched).
-            channel.status = "active"
-            event.metadata["channel_revived"] = True
-            logger.info("workspace_mod: revived deleted thread %s", channel_name)
+        if channel.status == "deleted":
+            # Task/issue DELETE deliberately retires this thread and cancels
+            # its work. A late message is not authorization to restore it.
+            raise EventRejected("workspace_mod", "channel_deleted_forbidden")
+        event.metadata["channel_id"] = str(channel.id)
 
     from app.services.personal_assistant import is_personal_channel
     personal_channel = channel is not None and is_personal_channel(db, channel)
@@ -2315,6 +2345,34 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
         if not _cvc(db, str(workspace.id), _Viewer(False, _sender_email), channel):
             logger.info("workspace_mod: refused post to private thread %s by %s", channel.name, _sender_email)
             raise EventRejected("workspace_mod", "private_thread")
+    elif channel is not None and (personal_channel or (channel.visibility or "workspace") == "private"):
+        # Recheck the resolved row, including a concurrent creator's winner.
+        # Resolve credentials exactly as the REST guard does: an identified
+        # agent is ACL-bound, while an explicit legacy machine remains exempt.
+        from app.services.access_model import agent_name_from_source
+        from app.services.visibility import resolve_viewer, can_view_channel
+        bearer = ctx.extra.get("bearer_token")
+        viewer = resolve_viewer(
+            db, workspace, ctx.extra.get("token"), f"Bearer {bearer}" if bearer else None,
+            agent_name=agent_name_from_source(event.source),
+        )
+        if not can_view_channel(db, str(workspace.id), viewer, channel):
+            raise EventRejected("workspace_mod", "private_thread")
+
+    # "thinking", "status", and "todos" messages are intermediate agent output
+    # — they should NOT trigger other agents. "approval" is an agent asking a
+    # PERSON for permission (see services/approvals): it is addressed to humans,
+    # never routed to agents.
+    if message_type in ("thinking", "status", "todos", "approval", "artifact"):
+        return event
+
+    # An agent's failure report ends its turn; it is never a request. Routed
+    # like a reply it reached another agent, whose answer @-ing the failed one
+    # ran it again — with nothing counting hops, a Codex on a 429 posted an
+    # error every ~20s for hours.
+    if event.source.startswith("openagents:") and _is_failure_report(event):
+        event.metadata["target_agents"] = ["__no_response__"]
+        return event
 
     if event.source.startswith("human:"):
         from app.services.message_replies import attach_reply
