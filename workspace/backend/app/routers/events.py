@@ -1386,6 +1386,52 @@ def _event_visible_to(event: dict, viewer_email: Optional[str], hidden_channels)
     return not (_is_person_addr(source) or _is_person_addr(target))
 
 
+def _resource_event_visible_to(event: dict, workspace_id: str, viewer) -> bool:
+    """Resource notices need the same read permission as their resource.
+
+    File and knowledge producers can target core (or a public channel) even
+    when the individual resource is private. Channel/DM checks are insufficient.
+    Aggregate notices without a resource id retain their existing semantics.
+    """
+    if viewer.machine:
+        return True
+    etype = str(event.get("type") or "")
+    payload = event.get("payload") or {}
+    if etype.startswith("workspace.file."):
+        kind, resource_id = "file", payload.get("file_id")
+    elif etype.startswith("workspace.knowledge."):
+        kind, resource_id = "knowledge", payload.get("entry_id")
+    else:
+        return True
+    if not resource_id:
+        return True
+    from app.models import WorkspaceMember
+    from app.services.access_model import Principal, allowed, load_resource, role_for_email
+    db = SessionLocal()
+    try:
+        # A stream outlives ownership/role changes. Rebuild from authoritative
+        # rows, with no request-scoped group cache or former owner inheritance.
+        if viewer.kind == "agent":
+            member = db.get(WorkspaceMember, (workspace_id, viewer.agent_name))
+            if member is None or member.status == "removed":
+                return False
+            # Keep an established agent identity restricted even if it loses
+            # its owner; never fall back to resolve_principal's legacy machine.
+            principal = Principal("agent", agent_name=member.agent_name,
+                                  owner_email=member.owner_email, workspace_id=workspace_id)
+        else:
+            workspace = db.get(Workspace, workspace_id)
+            if workspace is None:
+                return False
+            principal = Principal("human", email=viewer.email,
+                                  role=role_for_email(db, workspace, viewer.email),
+                                  workspace_id=workspace_id)
+        resource = load_resource(db, workspace_id, kind, resource_id)
+        return resource is not None and allowed(db, principal, resource, "read", workspace_id)
+    finally:
+        db.close()
+
+
 def _load_hidden_channel_names(workspace_id: str, viewer) -> set:
     db = SessionLocal()
     try:
@@ -1471,7 +1517,8 @@ async def stream_events(
     Visibility matches polling: the viewer is resolved once at connect (a
     bearer — header or `access_token` — wins over the workspace token). For a
     person, private threads they cannot see and DMs they are not a side of are
-    never streamed. Machines / identified agents receive everything.
+    never streamed. File and knowledge notices also require resource read
+    access for people and identified agents; legacy machines remain unfiltered.
     """
     effective_token = x_workspace_token or token
     if not authorization and access_token:
@@ -1512,6 +1559,8 @@ async def stream_events(
                     if not read_state_stream_allows(event, viewer):
                         pass
                     elif stream_filter is not None and not stream_filter.allows(event):
+                        pass
+                    elif not await run_in_threadpool(_resource_event_visible_to, event, workspace_id, viewer):
                         pass
                     elif not (target_prefix and event.get("target", "") != target_prefix):
                         event_id = event.get("id", "")

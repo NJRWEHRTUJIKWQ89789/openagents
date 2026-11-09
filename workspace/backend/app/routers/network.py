@@ -170,13 +170,22 @@ async def _emit_event(event: Event, workspace, db: Session, token: str = None):
         # a publish failure must not turn a committed write into an API error.
         # Heartbeats are not persisted and must not flood the event stream.
         try:
+            metadata = dict(result.metadata)
+            if result.type == "network.agent.join" or (
+                result.type == "workspace.message.posted" and result.source.startswith("openagents:")
+            ):
+                # These pipelines use session_id as an agent session credential.
+                # Other event types can use the same key for business metadata.
+                metadata.pop("session_id", None)
             snapshot = {
                 "id": result.id,
                 "type": result.type,
                 "source": result.source,
                 "target": result.target,
                 "payload": result.payload,
-                "metadata": result.metadata,
+                # Join returns the rotated session to its caller, not to
+                # every workspace subscriber. Keep the pipeline result intact.
+                "metadata": metadata,
                 "timestamp": result.timestamp,
                 "visibility": getattr(getattr(result, "visibility", None), "value", None)
                 or str(getattr(result, "visibility", None) or "channel"),
