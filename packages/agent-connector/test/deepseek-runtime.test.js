@@ -461,6 +461,35 @@ describe('failure classification', () => {
     assert.doesNotMatch(r.message, /next row/);
   });
 
+  for (const [label, earlierDiagnostic, expected] of cases) {
+    it(`prefers the terminal malformed error over earlier ${label} text`, () => {
+      const terminal = 'LlmError: tool input is invalid JSON (MALFORMED_RESPONSE)';
+      const result = classifyDshFailure({
+        code: 1,
+        stderr: `dsh: reasoning: investigate ${earlierDiagnostic}\n${terminal}\n`,
+      });
+      assert.deepEqual(result, { category: FAILURE.MALFORMED, message: terminal });
+    });
+
+    it(`preserves the terminal ${label} error after an earlier malformed example`, () => {
+      const result = classifyDshFailure({
+        code: 1,
+        stderr: `dsh: reasoning: a previous example had MALFORMED_RESPONSE\n${earlierDiagnostic}\n`,
+      });
+      assert.deepEqual(result, { category: expected, message: earlierDiagnostic });
+    });
+  }
+
+  for (const [label, diagnostic, expected] of cases) {
+    it(`does not classify stack frame paths or line numbers as ${label} diagnostics`, () => {
+      const result = classifyDshFailure({
+        code: 1,
+        stderr: `${diagnostic}\n    at run (file:///synthetic/plugin/profile.js:401:7)\n`,
+      });
+      assert.deepEqual(result, { category: expected, message: diagnostic });
+    });
+  }
+
   it('falls back to unknown with the exit code when stderr is empty', () => {
     const r = classifyDshFailure({ code: 3, stderr: '' });
     assert.equal(r.category, FAILURE.UNKNOWN);

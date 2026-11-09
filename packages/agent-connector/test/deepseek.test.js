@@ -347,6 +347,20 @@ describe('DeepSeek adapter — process handling', () => {
     assert.match(adapter._sent.error[0], /\(network\)/);
   });
 
+  it('posts the terminal malformed diagnostic instead of earlier reasoning', async () => {
+    const adapter = makeAdapter();
+    await run(adapter, 'hello', {
+      FAKE_SCENARIO: 'fail',
+      FAKE_STDERR: 'dsh: reasoning: check authentication and network settings\n'
+        + 'LlmError: tool input is invalid JSON (MALFORMED_RESPONSE)\n'
+        + '    at run (file:///synthetic/plugin/profile.js:401:7)\n',
+    });
+    assert.equal(adapter._sent.response.length, 0);
+    assert.equal(adapter._sent.error.length, 1);
+    assert.match(adapter._sent.error[0], /\(malformed\).*tool input is invalid JSON/);
+    assert.doesNotMatch(adapter._sent.error[0], /check authentication/);
+  });
+
   // 'close', not 'exit': a large write immediately before exit must arrive whole.
   it('captures the complete answer when the child exits mid-flush', async () => {
     const adapter = makeAdapter();

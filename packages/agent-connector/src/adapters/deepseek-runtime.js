@@ -636,9 +636,7 @@ const FAILURE_PATTERNS = [
   [FAILURE.NETWORK, /\b(econnrefused|enotfound|etimedout|econnreset|socket hang up|network|dns|proxy|certificate|tls|ssl|502|503|504)/i],
   [FAILURE.PERMISSION, /\b(eacces|eperm|erofs|permission denied|read[_\s-]?only file system|operation not permitted)/i],
   [FAILURE.VERSION, /\b(unsupported node|engine|requires node|syntaxerror.*unexpected token|err_require_esm|cannot use import statement)/i],
-  // Before CONFIG. dsh copies the model's reasoning onto stderr, and that
-  // prose often contains "row", "patch", or "profile". A later protocol
-  // error must win, and the line we return is what the channel shows.
+  // A protocol error may mention a profile or patch in its diagnostic.
   [FAILURE.MALFORMED, /\bMALFORMED_RESPONSE\b|tool input is invalid JSON/i],
   [FAILURE.CONFIG, /\b(profile|cordis|patch|settings\.yaml|plugin|bundle|dsh_home|composition|row)\b/i],
 ];
@@ -653,21 +651,6 @@ const FAILURE_PATTERNS = [
  * Returns { category, message } with the message already tail-bounded. The
  * caller is responsible for the final redaction pass.
  */
-/**
- * The last line of `detail` that `re` matches.
- *
- * dsh writes a long reasoning trace and then the terminal error. Callers cap
- * the posted text from the front, so the message has to be that error line
- * rather than the head of the trace.
- */
-function lastMatchingLine(detail, re) {
-  const lines = String(detail).split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (re.test(lines[i])) return lines[i].trim();
-  }
-  return '';
-}
-
 function classifyDshFailure({ code, signal, stderr } = {}) {
   const detail = tailStderr(stderr);
   if (signal) {
@@ -676,9 +659,18 @@ function classifyDshFailure({ code, signal, stderr } = {}) {
       message: `DeepSeek Harness was terminated by signal ${signal}.` + (detail ? `\n\n${detail}` : ''),
     };
   }
-  for (const [category, re] of FAILURE_PATTERNS) {
-    if (!re.test(detail)) continue;
-    return { category, message: lastMatchingLine(detail, re) || detail };
+  // dsh writes reasoning before the terminal diagnostic. Choose the latest
+  // matching line first, then apply category precedence within that line;
+  // otherwise an earlier mention of credentials/network/etc. hides the error.
+  const lines = detail.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const message = lines[i].trim();
+    // Stack frames are locations, not diagnostics. File names and line
+    // numbers can themselves match categories (plugin, profile, 401, etc.).
+    if (/^at\s/.test(message)) continue;
+    for (const [category, re] of FAILURE_PATTERNS) {
+      if (re.test(message)) return { category, message };
+    }
   }
   return {
     category: FAILURE.UNKNOWN,
